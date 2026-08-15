@@ -1,44 +1,60 @@
- require('jsonwebtoken');
+require('dotenv').config();
+const express = require('express');
+const axios = require('axios');
+const cors = require('cors');
+const { createClient } = require('@libsql/client');
+const jwt = require('jsonwebtoken');
 
 const app = express();
 app.use(express.json());
 app.use(cors());
 
-// Koneksi Database Turso Cloud SQLite
+// Initial Route untuk tes agar tidak 404
+app.get('/', (req, res) => {
+    res.json({ status: "OK", message: "Backend API KanzToko Serverless Berjalan Lancar!" });
+});
+
+// Koneksi Database Turso Cloud
 const db = createClient({
   url: process.env.TURSO_DATABASE_URL,
   authToken: process.env.TURSO_AUTH_TOKEN
 });
 
-// Auto Create Tables
+// Inisialisasi Tabel
 async function initDb() {
-    await db.execute(`CREATE TABLE IF NOT EXISTS products (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        name TEXT,
-        price INTEGER,
-        stock INTEGER
-    )`);
-    await db.execute(`CREATE TABLE IF NOT EXISTS transactions (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        order_id TEXT UNIQUE,
-        customer_phone TEXT,
-        description TEXT,
-        amount INTEGER,
-        status TEXT,
-        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-    )`);
-    await db.execute(`CREATE TABLE IF NOT EXISTS settings (
-        key TEXT PRIMARY KEY,
-        value TEXT
-    )`);
+    try {
+        await db.execute(`CREATE TABLE IF NOT EXISTS products (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT,
+            price INTEGER,
+            stock INTEGER
+        )`);
+        await db.execute(`CREATE TABLE IF NOT EXISTS transactions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            order_id TEXT UNIQUE,
+            customer_phone TEXT,
+            description TEXT,
+            amount INTEGER,
+            status TEXT,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )`);
+        await db.execute(`CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )`);
+    } catch (e) {
+        console.error("Db Init Error:", e);
+    }
 }
-initDb().catch(console.error);
+initDb();
 
 const getCasakuConfig = async () => {
-    const res = await db.execute("SELECT * FROM settings");
-    const config = {};
-    res.rows.forEach(r => config[r.key] = r.value);
-    return config;
+    try {
+        const res = await db.execute("SELECT * FROM settings");
+        const config = {};
+        if (res.rows) res.rows.forEach(r => config[r.key] = r.value);
+        return config;
+    } catch (e) { return {}; }
 };
 
 const authenticateAdmin = (req, res, next) => {
@@ -53,11 +69,11 @@ const authenticateAdmin = (req, res, next) => {
     }
 };
 
-// --- PUBLIC ROUTES ---
+// --- PUBLIC ENDPOINTS ---
 app.get('/api/products', async (req, res) => {
     try {
         const result = await db.execute("SELECT * FROM products");
-        res.json(result.rows);
+        res.json(result.rows || []);
     } catch (err) {
         res.status(500).json({ message: err.message });
     }
@@ -78,7 +94,7 @@ app.post('/api/create-transaction', async (req, res) => {
         const prodRes = await db.execute({ sql: "SELECT * FROM products WHERE id = ?", args: [item.id] });
         const prod = prodRes.rows[0];
         if (!prod || prod.stock < item.qty) {
-            return res.status(400).json({ message: `Stok produk ${item.name} habis!` });
+            return res.status(400).json({ message: `Stok produk ${item.name} tidak mencukupi!` });
         }
         totalAmount += prod.price * item.qty;
         itemsName.push(`${prod.name} (${item.qty}x)`);
@@ -108,7 +124,7 @@ app.post('/api/create-transaction', async (req, res) => {
             res.status(400).json({ message: "Gagal membuat invoice Casaku." });
         }
     } catch (error) {
-        res.status(500).json({ message: "Kesalahan server pembayaran." });
+        res.status(500).json({ message: "Gagal memproses transaksi." });
     }
 });
 
@@ -125,7 +141,7 @@ app.post('/api/casaku-callback', async (req, res) => {
             }
         }
 
-        const messageText = `*PEMBAYARAN SUCCESS!* 🎉\n\nNo. Order: ${order_id}\nProduk: ${description}\nTotal Bayar: Rp ${Number(amount).toLocaleString('id-ID')}\n\n*Terima kasih telah berbelanja!*`;
+        const messageText = `*PEMBAYARAN SUCCESS!* 🎉\n\nNo. Order: ${order_id}\nProduk: ${description}\nTotal Bayar: Rp ${Number(amount).toLocaleString('id-ID')}\n\n*Terima kasih telah berbelanja di KanzToko!*`;
         
         try {
             await axios.post('https://api.fonnte.com/send', { target: customer_phone, message: messageText }, {
@@ -138,14 +154,14 @@ app.post('/api/casaku-callback', async (req, res) => {
     res.status(400).json({ status: 'FAILED' });
 });
 
-// --- ADMIN ROUTES ---
+// --- ADMIN ENDPOINTS ---
 app.post('/api/admin/login', (req, res) => {
     const { username, password } = req.body;
     if (username === process.env.ADMIN_USERNAME && password === process.env.ADMIN_PASSWORD) {
         const token = jwt.sign({ username }, process.env.JWT_SECRET, { expiresIn: '12h' });
         return res.json({ success: true, token });
     }
-    res.status(401).json({ success: false, message: "Username/Password salah" });
+    res.status(401).json({ success: false, message: "Username/Password salah!" });
 });
 
 app.post('/api/admin/products', authenticateAdmin, async (req, res) => {
@@ -167,7 +183,7 @@ app.delete('/api/admin/products/:id', authenticateAdmin, async (req, res) => {
 
 app.get('/api/admin/transactions', authenticateAdmin, async (req, res) => {
     const result = await db.execute("SELECT * FROM transactions ORDER BY id DESC");
-    res.json(result.rows);
+    res.json(result.rows || []);
 });
 
 app.get('/api/admin/settings', authenticateAdmin, async (req, res) => {
@@ -179,8 +195,7 @@ app.post('/api/admin/settings', authenticateAdmin, async (req, res) => {
     const { merchant_id, api_key } = req.body;
     await db.execute({ sql: "INSERT OR REPLACE INTO settings (key, value) VALUES ('merchant_id', ?)", args: [merchant_id] });
     await db.execute({ sql: "INSERT OR REPLACE INTO settings (key, value) VALUES ('api_key', ?)", args: [api_key] });
-    res.json({ success: true, message: "Pengaturan API Disimpan!" });
+    res.json({ success: true, message: "Pengaturan Casaku Berhasil Disimpan!" });
 });
 
 module.exports = app;
-  
