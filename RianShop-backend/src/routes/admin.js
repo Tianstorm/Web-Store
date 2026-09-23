@@ -11,6 +11,7 @@ const { getRipayConfig, simulatePayment } = require('../services/ripay');
 const {
   getOrder,
   refreshOrder,
+  retryOrder,
   serializeOrder,
   serializeProduct,
 } = require('../services/orders');
@@ -29,12 +30,15 @@ const sensitiveSettings = new Set([
 router.post('/login', async (req, res) => {
   const expectedUsername = await getSetting(
     'admin_username',
-    process.env.ADMIN_USERNAME || 'admin',
+    process.env.ADMIN_USERNAME || '',
   );
   const expectedPassword = await getSetting(
     'admin_password',
-    process.env.ADMIN_PASSWORD || 'change-me',
+    process.env.ADMIN_PASSWORD || '',
   );
+  if (!expectedUsername || !expectedPassword) {
+    return res.status(503).json({ error: 'Kredensial admin belum dikonfigurasi' });
+  }
   const valid =
     timingSafeEqualText(req.body?.username, expectedUsername) &&
     timingSafeEqualText(req.body?.password, expectedPassword);
@@ -246,17 +250,7 @@ router.post('/orders/:publicId/retry', async (req, res, next) => {
   try {
     const data = await getOrder(req.params.publicId);
     if (!data) return res.status(404).json({ error: 'Pesanan tidak ditemukan' });
-    await db.execute({
-      sql: `UPDATE orders SET status = CASE WHEN paid_at IS NULL THEN 'pending_payment' ELSE 'processing' END,
-        failure_reason = '', updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
-      args: [data.row.id],
-    });
-    await db.execute({
-      sql: `UPDATE order_items SET status = CASE WHEN ? IS NULL THEN 'waiting_payment' ELSE 'processing' END,
-        failure_reason = '', updated_at = CURRENT_TIMESTAMP WHERE order_id = ? AND status IN ('failed', 'needs_action')`,
-      args: [data.row.paid_at, data.row.id],
-    });
-    return res.json({ order: await refreshOrder(req.params.publicId) });
+    return res.json({ order: await retryOrder(req.params.publicId) });
   } catch (error) {
     return next(error);
   }

@@ -19,15 +19,16 @@ API berjalan di `http://localhost:3000`. Database lokal tersimpan di
 ## Konfigurasi wajib
 
 - `JWT_SECRET`: secret panjang untuk sesi admin.
-- `SETTINGS_ENCRYPTION_KEY`: secret untuk enkripsi kredensial integrasi.
+- `SETTINGS_ENCRYPTION_KEY`: wajib diisi sebelum kredensial sensitif dapat disimpan dari admin.
 - `RIPAY_API_KEY` dan `RIPAY_API_SECRET`: kredensial Ripay.
 - `DIGIFLAZZ_USERNAME`, `DIGIFLAZZ_API_KEY`, dan
   `DIGIFLAZZ_WEBHOOK_SECRET`: kredensial buyer dan validasi webhook Digiflazz.
 - `FRONTEND_URL` dan `BACKEND_URL`: URL publik frontend dan backend.
-- `ADMIN_USERNAME` dan `ADMIN_PASSWORD`: login awal admin.
+- `ADMIN_USERNAME` dan `ADMIN_PASSWORD`: wajib diisi; aplikasi tidak menyediakan kredensial bawaan.
 
 Nilai integrasi juga dapat disimpan dari dashboard admin. Nilai sensitif
-dienkripsi dengan AES-256-GCM bila `SETTINGS_ENCRYPTION_KEY` tersedia.
+dienkripsi dengan AES-256-GCM. Penyimpanan rahasia ditolak bila
+`SETTINGS_ENCRYPTION_KEY` belum dikonfigurasi.
 
 ## Fulfillment
 

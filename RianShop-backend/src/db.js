@@ -42,6 +42,7 @@ const schema = [
     reserved_order_id INTEGER,
     delivered_at TEXT,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY(product_id) REFERENCES products(id) ON DELETE CASCADE
   )`,
   `CREATE TABLE IF NOT EXISTS orders (
@@ -57,6 +58,7 @@ const schema = [
     payment_url TEXT NOT NULL DEFAULT '',
     qr_image_url TEXT NOT NULL DEFAULT '',
     payment_expires_at TEXT,
+    access_token_hash TEXT NOT NULL DEFAULT '',
     paid_at TEXT,
     completed_at TEXT,
     receipt_json TEXT NOT NULL DEFAULT '{}',
@@ -75,7 +77,11 @@ const schema = [
     provider_sku TEXT NOT NULL DEFAULT '',
     customer_data_json TEXT NOT NULL DEFAULT '{}',
     fulfillment_json TEXT NOT NULL DEFAULT '{}',
+    provider_ref TEXT,
+    failure_reason TEXT NOT NULL DEFAULT '',
     status TEXT NOT NULL DEFAULT 'pending',
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY(order_id) REFERENCES orders(id) ON DELETE CASCADE
   )`,
   `CREATE TABLE IF NOT EXISTS settings (
@@ -84,10 +90,49 @@ const schema = [
     sensitive INTEGER NOT NULL DEFAULT 0,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
   )`,
-  `CREATE INDEX IF NOT EXISTS idx_products_active_category ON products(active, category)`,
-  `CREATE INDEX IF NOT EXISTS idx_inventory_product_status ON inventory(product_id, status)`,
-  `CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status, created_at)`,
-  `CREATE INDEX IF NOT EXISTS idx_order_items_order ON order_items(order_id)`,
+];
+
+const migrations = {
+  products: {
+    slug: "TEXT NOT NULL DEFAULT ''",
+    category: "TEXT NOT NULL DEFAULT 'Lainnya'",
+    description: "TEXT NOT NULL DEFAULT ''",
+    image_url: "TEXT NOT NULL DEFAULT ''",
+    icon: "TEXT NOT NULL DEFAULT 'sparkles'",
+    fulfillment_type: "TEXT NOT NULL DEFAULT 'manual'",
+    provider_sku: "TEXT NOT NULL DEFAULT ''",
+    customer_fields_json: "TEXT NOT NULL DEFAULT '[]'",
+    metadata_json: "TEXT NOT NULL DEFAULT '{}'",
+    active: 'INTEGER NOT NULL DEFAULT 1',
+    created_at: "TEXT NOT NULL DEFAULT ''",
+    updated_at: "TEXT NOT NULL DEFAULT ''",
+  },
+  inventory: {
+    updated_at: "TEXT NOT NULL DEFAULT ''",
+  },
+  orders: {
+    access_token_hash: "TEXT NOT NULL DEFAULT ''",
+  },
+  order_items: {
+    provider_ref: 'TEXT',
+    failure_reason: "TEXT NOT NULL DEFAULT ''",
+    created_at: "TEXT NOT NULL DEFAULT ''",
+    updated_at: "TEXT NOT NULL DEFAULT ''",
+  },
+  settings: {
+    sensitive: 'INTEGER NOT NULL DEFAULT 0',
+    updated_at: "TEXT NOT NULL DEFAULT ''",
+  },
+};
+
+const indexes = [
+  'CREATE UNIQUE INDEX IF NOT EXISTS idx_products_slug ON products(slug)',
+  'CREATE INDEX IF NOT EXISTS idx_products_active_category ON products(active, category)',
+  'CREATE INDEX IF NOT EXISTS idx_inventory_product_status ON inventory(product_id, status)',
+  'CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status, created_at)',
+  'CREATE INDEX IF NOT EXISTS idx_order_items_order ON order_items(order_id)',
+  `CREATE UNIQUE INDEX IF NOT EXISTS idx_order_items_provider_ref
+    ON order_items(provider_ref) WHERE provider_ref IS NOT NULL AND provider_ref != ''`,
 ];
 
 const seedProducts = [
@@ -203,6 +248,8 @@ const seedProducts = [
 
 async function initializeDatabase() {
   for (const statement of schema) await db.execute(statement);
+  await migrateLegacySchema();
+  for (const statement of indexes) await db.execute(statement);
 
   for (const product of seedProducts) {
     await db.execute({
@@ -240,6 +287,43 @@ async function initializeDatabase() {
       ],
     });
   }
+}
+
+async function migrateLegacySchema() {
+  for (const [table, columns] of Object.entries(migrations)) {
+    const info = await db.execute(`PRAGMA table_info(${table})`);
+    const existing = new Set(info.rows.map((row) => String(row.name)));
+    for (const [column, definition] of Object.entries(columns)) {
+      if (existing.has(column)) continue;
+      await db.execute(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+    }
+  }
+
+  const legacyProducts = await db.execute(
+    "SELECT id, name FROM products WHERE slug = '' OR slug IS NULL",
+  );
+  for (const product of legacyProducts.rows) {
+    const base = String(product.name || 'product')
+      .toLowerCase()
+      .normalize('NFKD')
+      .replace(/[^\w\s-]/g, '')
+      .trim()
+      .replace(/[\s_-]+/g, '-');
+    await db.execute({
+      sql: `UPDATE products SET slug = ?, created_at = COALESCE(NULLIF(created_at, ''), CURRENT_TIMESTAMP),
+        updated_at = COALESCE(NULLIF(updated_at, ''), CURRENT_TIMESTAMP) WHERE id = ?`,
+      args: [`${base || 'product'}-${product.id}`, product.id],
+    });
+  }
+  await db.execute(
+    "UPDATE inventory SET updated_at = COALESCE(NULLIF(updated_at, ''), created_at, CURRENT_TIMESTAMP)",
+  );
+  await db.execute(
+    "UPDATE order_items SET created_at = COALESCE(NULLIF(created_at, ''), CURRENT_TIMESTAMP), updated_at = COALESCE(NULLIF(updated_at, ''), CURRENT_TIMESTAMP)",
+  );
+  await db.execute(
+    "UPDATE settings SET updated_at = COALESCE(NULLIF(updated_at, ''), CURRENT_TIMESTAMP)",
+  );
 }
 
 async function getSetting(key, fallback = '') {

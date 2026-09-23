@@ -1,3 +1,4 @@
+const crypto = require('node:crypto');
 const { db } = require('../db');
 const { frontendUrl } = require('../config');
 const { asJson, createPublicId, interpolate, isValidPhone, normalizePhone } = require('../utils');
@@ -51,6 +52,24 @@ function serializeOrder(row, items = []) {
   };
 }
 
+function accessTokenHash(token) {
+  return crypto.createHash('sha256').update(String(token || '')).digest('hex');
+}
+
+function assertOrderAccess(row, token) {
+  const expected = String(row.access_token_hash || '');
+  const actual = accessTokenHash(token);
+  if (
+    !expected ||
+    expected.length !== actual.length ||
+    !crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(actual))
+  ) {
+    const error = new Error('Token akses pesanan tidak valid');
+    error.status = 403;
+    throw error;
+  }
+}
+
 async function getOrder(publicId) {
   const result = await db.execute({
     sql: 'SELECT * FROM orders WHERE public_id = ?',
@@ -72,7 +91,10 @@ function validateCustomerData(product, data) {
     if (field.required && !value) {
       throw new Error(`${field.label || field.name} wajib diisi untuk ${product.name}`);
     }
-    if (value && field.pattern && !new RegExp(field.pattern).test(value)) {
+    if (value.length > 200) {
+      throw new Error(`${field.label || field.name} terlalu panjang`);
+    }
+    if (value && field.type === 'tel' && !/^\d{8,16}$/.test(value.replace(/\D/g, ''))) {
       throw new Error(`${field.label || field.name} tidak valid`);
     }
   }
@@ -102,8 +124,11 @@ async function createOrder(input) {
 
   for (const entry of cart) {
     const product = productMap.get(Number(entry.product_id));
-    const quantity = Math.max(1, Math.min(10, Number(entry.quantity || 1)));
+    const quantity = Number(entry.quantity);
     if (!product) throw new Error('Salah satu produk tidak tersedia');
+    if (!Number.isInteger(quantity) || quantity < 1 || quantity > 10) {
+      throw new Error(`Jumlah ${product.name} tidak valid`);
+    }
     if (product.fulfillment_type === 'digiflazz' && quantity !== 1) {
       throw new Error(`${product.name} hanya dapat dibeli satu per transaksi`);
     }
@@ -117,20 +142,31 @@ async function createOrder(input) {
   if (totalAmount < 1) throw new Error('Total pesanan tidak valid');
 
   const publicId = createPublicId('RS');
-  const orderResult = await db.execute({
-    sql: `INSERT INTO orders
-      (public_id, customer_name, customer_phone, customer_email, total_amount, status)
-      VALUES (?, ?, ?, ?, ?, 'creating')`,
-    args: [publicId, customerName, customerPhone, customerEmail, totalAmount],
-  });
-  const orderId = Number(orderResult.lastInsertRowid);
-
+  const accessToken = crypto.randomBytes(32).toString('base64url');
+  let orderId;
+  const transaction = await db.transaction('write');
   try {
+    const orderResult = await transaction.execute({
+      sql: `INSERT INTO orders
+        (public_id, customer_name, customer_phone, customer_email, total_amount, status, access_token_hash)
+        VALUES (?, ?, ?, ?, ?, 'creating', ?)`,
+      args: [
+        publicId,
+        customerName,
+        customerPhone,
+        customerEmail,
+        totalAmount,
+        accessTokenHash(accessToken),
+      ],
+    });
+    orderId = Number(orderResult.lastInsertRowid);
+
     for (const entry of normalizedItems) {
-      const itemResult = await db.execute({
+      await transaction.execute({
         sql: `INSERT INTO order_items
-          (order_id, product_id, product_name, unit_price, quantity, fulfillment_type, provider_sku, customer_data_json)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+          (order_id, product_id, product_name, unit_price, quantity, fulfillment_type,
+            provider_sku, customer_data_json, status)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'waiting_payment')`,
         args: [
           orderId,
           entry.product.id,
@@ -144,7 +180,7 @@ async function createOrder(input) {
       });
 
       if (entry.product.fulfillment_type === 'inventory') {
-        const available = await db.execute({
+        const available = await transaction.execute({
           sql: `SELECT id FROM inventory
             WHERE product_id = ? AND status = 'available'
             ORDER BY id LIMIT ?`,
@@ -154,23 +190,32 @@ async function createOrder(input) {
           throw new Error(`Inventori ${entry.product.name} tidak mencukupi`);
         }
         for (const stock of available.rows) {
-          await db.execute({
+          const reservation = await transaction.execute({
             sql: `UPDATE inventory SET status = 'reserved', reserved_order_id = ?, updated_at = CURRENT_TIMESTAMP
               WHERE id = ? AND status = 'available'`,
             args: [orderId, stock.id],
           });
+          if (Number(reservation.rowsAffected) !== 1) {
+            throw new Error(`Inventori ${entry.product.name} baru saja habis`);
+          }
         }
-        await db.execute({
-          sql: 'UPDATE products SET stock = stock - ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?',
-          args: [entry.quantity, entry.product.id],
+        await transaction.execute({
+          sql: `UPDATE products SET stock = (
+              SELECT COUNT(*) FROM inventory WHERE product_id = ? AND status = 'available'
+            ), updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+          args: [entry.product.id, entry.product.id],
         });
       }
-      await db.execute({
-        sql: 'UPDATE order_items SET status = ? WHERE id = ?',
-        args: ['waiting_payment', itemResult.lastInsertRowid],
-      });
     }
+    await transaction.commit();
+  } catch (error) {
+    await transaction.rollback();
+    throw error;
+  } finally {
+    transaction.close();
+  }
 
+  try {
     const payment = await createPayment({
       amount: totalAmount,
       customerRef: publicId,
@@ -189,7 +234,7 @@ async function createOrder(input) {
       ],
     });
     const created = await getOrder(publicId);
-    return serializeOrder(created.row, created.items);
+    return { ...serializeOrder(created.row, created.items), access_token: accessToken };
   } catch (error) {
     await releaseInventory(orderId);
     await db.execute({
@@ -201,28 +246,40 @@ async function createOrder(input) {
 }
 
 async function releaseInventory(orderId) {
-  const reserved = await db.execute({
-    sql: `SELECT inventory.id, inventory.product_id FROM inventory
-      WHERE reserved_order_id = ? AND status = 'reserved'`,
-    args: [orderId],
-  });
-  for (const row of reserved.rows) {
-    await db.execute({
-      sql: `UPDATE inventory SET status = 'available', reserved_order_id = NULL, updated_at = CURRENT_TIMESTAMP
-        WHERE id = ?`,
-      args: [row.id],
+  const transaction = await db.transaction('write');
+  try {
+    const reserved = await transaction.execute({
+      sql: `SELECT DISTINCT product_id FROM inventory
+        WHERE reserved_order_id = ? AND status = 'reserved'`,
+      args: [orderId],
     });
-    await db.execute({
-      sql: 'UPDATE products SET stock = stock + 1, updated_at = CURRENT_TIMESTAMP WHERE id = ?',
-      args: [row.product_id],
+    await transaction.execute({
+      sql: `UPDATE inventory SET status = 'available', reserved_order_id = NULL,
+        updated_at = CURRENT_TIMESTAMP WHERE reserved_order_id = ? AND status = 'reserved'`,
+      args: [orderId],
     });
+    for (const row of reserved.rows) {
+      await transaction.execute({
+        sql: `UPDATE products SET stock = (
+            SELECT COUNT(*) FROM inventory WHERE product_id = ? AND status = 'available'
+          ), updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+        args: [row.product_id, row.product_id],
+      });
+    }
+    await transaction.commit();
+  } catch (error) {
+    await transaction.rollback();
+    throw error;
+  } finally {
+    transaction.close();
   }
 }
 
-async function refreshOrder(publicId) {
+async function refreshOrder(publicId, accessToken) {
   const data = await getOrder(publicId);
   if (!data) return null;
   const { row } = data;
+  if (accessToken !== undefined) assertOrderAccess(row, accessToken);
   if (!row.payment_trx_id || !['pending_payment', 'paid', 'processing'].includes(String(row.status))) {
     return serializeOrder(row, data.items);
   }
@@ -298,6 +355,13 @@ async function fulfillOrder(publicId) {
         const customerNo = interpolate(template, customerData).replace(/\D/g, '');
         if (!customerNo) throw new Error('Nomor tujuan provider tidak valid');
         const providerRef = item.provider_ref || createPublicId('DF');
+        if (!item.provider_ref) {
+          await db.execute({
+            sql: `UPDATE order_items SET provider_ref = ?, status = 'processing',
+              updated_at = CURRENT_TIMESTAMP WHERE id = ? AND provider_ref IS NULL`,
+            args: [providerRef, item.id],
+          });
+        }
         const response = await topup({
           sku: item.provider_sku,
           customerNo,
@@ -342,6 +406,106 @@ async function fulfillOrder(publicId) {
   });
 
   if (allFulfilled) await notifyOrder(publicId);
+}
+
+async function reserveInventoryForRetry(order) {
+  const transaction = await db.transaction('write');
+  try {
+    for (const item of order.items) {
+      if (String(item.fulfillment_type) !== 'inventory') continue;
+      const available = await transaction.execute({
+        sql: `SELECT id FROM inventory WHERE product_id = ? AND status = 'available'
+          ORDER BY id LIMIT ?`,
+        args: [item.product_id, item.quantity],
+      });
+      if (available.rows.length < Number(item.quantity)) {
+        throw new Error(`Inventori ${item.product_name} tidak mencukupi`);
+      }
+      for (const stock of available.rows) {
+        const reservation = await transaction.execute({
+          sql: `UPDATE inventory SET status = 'reserved', reserved_order_id = ?,
+            updated_at = CURRENT_TIMESTAMP WHERE id = ? AND status = 'available'`,
+          args: [order.row.id, stock.id],
+        });
+        if (Number(reservation.rowsAffected) !== 1) {
+          throw new Error(`Inventori ${item.product_name} baru saja habis`);
+        }
+      }
+      await transaction.execute({
+        sql: `UPDATE products SET stock = (
+            SELECT COUNT(*) FROM inventory WHERE product_id = ? AND status = 'available'
+          ), updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+        args: [item.product_id, item.product_id],
+      });
+    }
+    await transaction.execute({
+      sql: `UPDATE order_items SET status = 'waiting_payment', failure_reason = '',
+        updated_at = CURRENT_TIMESTAMP WHERE order_id = ?`,
+      args: [order.row.id],
+    });
+    await transaction.commit();
+  } catch (error) {
+    await transaction.rollback();
+    throw error;
+  } finally {
+    transaction.close();
+  }
+}
+
+async function retryOrder(publicId) {
+  const data = await getOrder(publicId);
+  if (!data) return null;
+  if (data.row.paid_at) {
+    await db.execute({
+      sql: `UPDATE orders SET status = 'processing', failure_reason = '',
+        updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+      args: [data.row.id],
+    });
+    await db.execute({
+      sql: `UPDATE order_items SET status = 'processing', failure_reason = '',
+        updated_at = CURRENT_TIMESTAMP WHERE order_id = ? AND status IN ('failed', 'needs_action')`,
+      args: [data.row.id],
+    });
+    await fulfillOrder(publicId);
+    const latest = await getOrder(publicId);
+    return serializeOrder(latest.row, latest.items);
+  }
+
+  if (!['expired', 'failed'].includes(String(data.row.status))) {
+    throw new Error('Pesanan belum dapat dibuatkan pembayaran baru');
+  }
+  await releaseInventory(data.row.id);
+  await reserveInventoryForRetry(data);
+  try {
+    const payment = await createPayment({
+      amount: Number(data.row.total_amount),
+      customerRef: `${publicId}-${Date.now()}`,
+      note: `Pembayaran ulang ${publicId}`,
+      redirectUrl: `${frontendUrl.replace(/\/$/, '')}/?order=${encodeURIComponent(publicId)}`,
+    });
+    await db.execute({
+      sql: `UPDATE orders SET status = 'pending_payment', payment_trx_id = ?, payment_url = ?,
+        qr_image_url = ?, payment_expires_at = ?, failure_reason = '',
+        updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+      args: [
+        payment.trx_id,
+        payment.payment_page_url,
+        payment.qr_image_url || '',
+        payment.expires_at || null,
+        data.row.id,
+      ],
+    });
+  } catch (error) {
+    await releaseInventory(data.row.id);
+    await db.execute({
+      sql: `UPDATE orders SET status = 'failed', failure_reason = ?,
+        updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+      args: [error.message, data.row.id],
+    });
+    throw error;
+  }
+  const latest = await getOrder(publicId);
+  return serializeOrder(latest.row, latest.items);
 }
 
 async function markItemFulfilled(itemId, fulfillment) {
@@ -423,6 +587,7 @@ module.exports = {
   handleDigiflazzCallback,
   processOpenOrders,
   refreshOrder,
+  retryOrder,
   serializeOrder,
   serializeProduct,
 };

@@ -8,7 +8,9 @@ function keyBuffer() {
 
 function encrypt(value) {
   const key = keyBuffer();
-  if (!key || !value) return String(value || '');
+  if (!key) {
+    throw new Error('SETTINGS_ENCRYPTION_KEY wajib dikonfigurasi sebelum menyimpan rahasia');
+  }
   const iv = crypto.randomBytes(12);
   const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
   const ciphertext = Buffer.concat([cipher.update(String(value), 'utf8'), cipher.final()]);

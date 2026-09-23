@@ -37,9 +37,10 @@ app.use('/api', publicRoutes);
 
 app.use((error, _req, res, _next) => {
   const status =
+    Number(error.status) || (
     error.type === 'entity.too.large' ? 413 :
-    /wajib|tidak valid|tidak tersedia|belum diatur|belum dikonfigurasi/i.test(error.message) ? 400 :
-    500;
+    /wajib|tidak valid|tidak tersedia|tidak mencukupi|baru saja habis|terlalu panjang|belum diatur|belum dikonfigurasi/i.test(error.message) ? 400 :
+    500);
   if (status === 500) console.error(error);
   res.status(status).json({ error: error.message || 'Terjadi kesalahan pada server' });
 });
